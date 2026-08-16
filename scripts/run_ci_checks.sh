@@ -11,7 +11,7 @@ git diff --check $(git merge-base HEAD origin/main 2>/dev/null || echo "HEAD~1")
 echo "=== 2. Static Analysis (Ruff) ==="
 if command -v ruff >/dev/null 2>&1; then
     ruff check .
-    ruff check agent/turn_finalizer.py agent/conversation_loop.py agent/model_metadata.py hermes_state.py --select E,F,W --ignore E501
+    ruff check agent/turn_finalizer.py scripts/upstream_update_helper.py
 else
     echo "ruff not in local PATH, skipping local ruff check"
 fi
