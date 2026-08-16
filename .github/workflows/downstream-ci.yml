@@ -1,0 +1,74 @@
+name: Downstream Hardening CI
+
+on:
+  push:
+    branches:
+      - 'release/**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - 'main'
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  downstream-checks:
+    name: Downstream Hardening Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git Diff & Whitespace Check
+        run: |
+          git diff --check $(git merge-base HEAD origin/main 2>/dev/null || echo "HEAD~1")..HEAD || git diff --check
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          version: "latest"
+
+      - name: Install Dependencies from Frozen Lockfile
+        run: |
+          uv sync --locked --all-extras
+
+      - name: Static Analysis (Ruff)
+        run: |
+          uv run ruff check agent/ hermes_cli/ hermes_state/ tools/ --select E,F,W --ignore E501
+
+      - name: Run Targeted Hardening Pytest Suite
+        run: |
+          uv run pytest \
+            tests/agent/test_finalization_gate.py \
+            tests/agent/test_message_metadata.py \
+            tests/hermes_state/test_message_finalization_metadata.py \
+            tests/hermes_state/test_isolation_marker_env.py \
+            tests/run_agent/test_safety_finalization_containment.py \
+            tests/tools/test_session_search.py \
+            -v --tb=short
+
+      - name: Generate Review Bundle
+        if: always()
+        run: |
+          python3 scripts/upstream_update_helper.py review-bundle v2026.8.13 review-bundle.md || echo "Review bundle generation skipped"
+
+      - name: Upload Review Bundle Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-bundle
+          path: review-bundle.md
+          if-no-files-found: ignore
