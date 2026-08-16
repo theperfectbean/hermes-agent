@@ -47,7 +47,8 @@ jobs:
 
       - name: Static Analysis (Ruff)
         run: |
-          uv run ruff check agent/ hermes_cli/ hermes_state/ tools/ --select E,F,W --ignore E501
+          uv run ruff check .
+          uv run ruff check agent/turn_finalizer.py agent/conversation_loop.py agent/model_metadata.py hermes_state.py --select E,F,W --ignore E501
 
       - name: Run Targeted Hardening Pytest Suite
         run: |

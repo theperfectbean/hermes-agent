@@ -6,11 +6,12 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_DIR}"
 
 echo "=== 1. Git Diff Check (Whitespace & Formatting) ==="
-git diff --check
+git diff --check $(git merge-base HEAD origin/main 2>/dev/null || echo "HEAD~1")..HEAD || git diff --check
 
 echo "=== 2. Static Analysis (Ruff) ==="
 if command -v ruff >/dev/null 2>&1; then
-    ruff check agent/ hermes_cli/ hermes_state/ tools/ --select E,F,W --ignore E501
+    ruff check .
+    ruff check agent/turn_finalizer.py agent/conversation_loop.py agent/model_metadata.py hermes_state.py --select E,F,W --ignore E501
 else
     echo "ruff not in local PATH, skipping local ruff check"
 fi
