@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
 
 
@@ -53,6 +54,10 @@ _VERIFICATION_CONTINUATION_FLAGS = (
     "_pre_verify_synthetic",
 )
 
+_SAFETY_FINALIZATION_FLAGS = (
+    "_safety_finalization_candidate",
+)
+
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
@@ -64,6 +69,14 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     messages[:] = [
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
+    ]
+
+
+def _drop_safety_finalization_scaffolding(messages) -> None:
+    """Drop held candidates and their synthetic follow-ups before durability."""
+    messages[:] = [
+        m for m in messages
+        if not (isinstance(m, dict) and any(m.get(f) for f in _SAFETY_FINALIZATION_FLAGS))
     ]
 
 
@@ -272,6 +285,7 @@ def finalize_turn(
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
+        _drop_safety_finalization_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
@@ -315,7 +329,10 @@ def finalize_turn(
             if _tail_role != "assistant":
                 # Tail is not an assistant row — append the final response
                 # so the durable turn closes with the answer (#43849/#44100).
-                messages.append({"role": "assistant", "content": final_response})
+                append_message(
+                    messages,
+                    {"role": "assistant", "content": final_response},
+                )
             elif isinstance(_tail, dict) and _tail.get("content") != final_response and _is_pure_tool_call_tail(_tail):
                 # The tail IS an assistant row, but a *pure tool-call turn*:
                 # tool_calls with no text of its own. The role check alone
@@ -332,6 +349,10 @@ def finalize_turn(
                 # candidate collapse — the provisional answer was persisted and
                 # reused as the terminal response, #65919 §7).
                 _tail["content"] = final_response
+                # The normal assistant builder already stamps this row. Cover
+                # legacy/exceptional pure-tool tails before they become a
+                # delivered final response.
+                stamp_message_timestamp(_tail)
                 # The row may have already been flushed to SQLite by the
                 # incremental tool-call persist (conversation_loop.py:4990),
                 # which stamps ``_DB_PERSISTED_MARKER`` so subsequent flushes
@@ -346,6 +367,25 @@ def finalize_turn(
                 # this pop is the one place that does. Invalidate it so the
                 # filled row is re-examined instead of skipped.
                 agent._db_flush_scan_prefix = None
+
+        # Forward-only safety metadata belongs to the released final assistant
+        # row, never the provisional candidate. Historical/ordinary rows remain
+        # NULL and provider replay ignores these persistence-only fields.
+        _safety_status = getattr(agent, "_safety_finalization_status", None)
+        if _safety_status and final_response and not interrupted:
+            for _candidate in reversed(messages):
+                if (
+                    isinstance(_candidate, dict)
+                    and _candidate.get("role") == "assistant"
+                    and _candidate.get("content") == final_response
+                ):
+                    _candidate["model"] = getattr(agent, "model", None)
+                    _candidate["billing_provider"] = getattr(agent, "provider", None)
+                    _candidate["operational_status"] = _safety_status
+                    _candidate["evidence_metadata"] = getattr(
+                        agent, "_safety_finalization_metadata", None
+                    )
+                    break
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
@@ -652,6 +692,19 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    # A held stream reaches any delivery surface only after final response
+    # construction has completed. A withheld candidate is discarded rather
+    # than becoming a previewed or replayable completion claim.
+    if getattr(agent, "_safety_finalization_hold", False):
+        if getattr(agent, "_safety_finalization_status", None) == "verified":
+            _release = getattr(agent, "_release_safety_finalization_output", None)
+            if callable(_release):
+                _release()
+        else:
+            _discard = getattr(agent, "_discard_safety_finalization_output", None)
+            if callable(_discard):
+                _discard()
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
@@ -666,6 +719,7 @@ def finalize_turn(
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
+        "operational_status": getattr(agent, "_safety_finalization_status", None),
         "model": agent.model,
         "provider": agent.provider,
         "base_url": agent.base_url,

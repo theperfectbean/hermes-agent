@@ -42,6 +42,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
+from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -485,6 +486,17 @@ def build_turn_context(
     # after primary restoration has settled the runtime.
     try:
         from agent.auxiliary_client import set_runtime_main
+        from agent.prompt_cache_scope import resolve_prompt_cache_scope_safe
+        # Rotation-stable prompt-cache scope. Memoized per segment on the
+        # agent, so this is a DB walk at most once per segment — except a
+        # brand-new session whose row lands later in turn setup
+        # (_ensure_db_session); that first turn falls back to the physical
+        # id here and the first build_api_kwargs re-resolves. Stays valid
+        # through a mid-turn compression rotation because the lineage root
+        # is by definition rotation-invariant (#79017). Resolved with the
+        # never-raising variant OUTSIDE the argument list, so a resolution
+        # failure can only lose the scope — never the whole runtime binding.
+        _cache_scope = resolve_prompt_cache_scope_safe(agent) or ""
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
@@ -494,6 +506,7 @@ def build_turn_context(
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
             session_id=getattr(agent, "session_id", "") or "",
+            cache_scope=_cache_scope,
         )
     except Exception:
         pass
@@ -625,9 +638,15 @@ def build_turn_context(
         # the same dict and any close-path durable marker.
         user_msg["content"] = user_message
     else:
-        user_msg = {"role": "user", "content": user_message}
+        user_msg = stamp_message_timestamp(
+            {"role": "user", "content": user_message},
+            timestamp=persist_user_timestamp,
+        )
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
+    # CLI input is stamped when staged. Gateway input may carry the platform
+    # event time. Preserve either value and cover any legacy unstamped handoff.
+    stamp_message_timestamp(user_msg, timestamp=persist_user_timestamp)
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
@@ -659,7 +678,7 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
-    messages.append(user_msg)
+    append_message(messages, user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
@@ -1231,6 +1250,51 @@ def build_turn_context(
     agent._turn_file_mutation_paths = set()
     agent._verification_stop_nudges = 0
     agent._pre_verify_nudges = 0
+    agent._safety_finalization_nudges = 0
+    agent._safety_finalization_hold = False
+    agent._safety_gate_owner = None
+    agent._safety_finalization_status = None
+    agent._safety_finalization_metadata = None
+    agent._safety_buffered_stream = []
+    agent._safety_buffered_interim = []
+    agent._safety_buffered_stream_end = None
+    agent._safety_finalization_released = False
+    agent._safety_finalization_started_at = time.time()
+    agent._internal_policy_continuation = None
+
+    # A local policy must opt in before the first provider token. The generic
+    # core has no material-work classifier and therefore preserves ordinary
+    # Hermes streaming when no plugin explicitly returns {"action": "hold"}.
+    try:
+        from agent.finalization_gate import start_hold_required
+        from hermes_cli.lifecycle import has_hook, invoke_hook
+
+        if has_hook("pre_finalize"):
+            _prior_safety_record = None
+            _state_db = getattr(agent, "_session_db", None)
+            _last_record = getattr(_state_db, "get_latest_safety_record", None)
+            if callable(_last_record):
+                _prior_safety_record = _last_record(agent.session_id or "")
+            _start_results = invoke_hook(
+                "pre_finalize",
+                phase="start",
+                session_id=agent.session_id or "",
+                platform=getattr(agent, "platform", "") or "",
+                model=getattr(agent, "model", "") or "",
+                provider=getattr(agent, "provider", "") or "",
+                operator_request=original_user_message,
+                candidate_response="",
+                attempt=0,
+                changed_paths=[],
+                evidence=[],
+                turn_started_at=agent._safety_finalization_started_at,
+                prior_safety_record=_prior_safety_record,
+            )
+            _hold, _owner = start_hold_required(_start_results)
+            agent._safety_finalization_hold = _hold
+            agent._safety_gate_owner = _owner
+    except Exception:
+        logger.warning("pre_finalize start hook failed", exc_info=True)
 
     # Record the execution thread so interrupt()/clear_interrupt() can scope
     # the tool-level interrupt signal to THIS agent's thread only.

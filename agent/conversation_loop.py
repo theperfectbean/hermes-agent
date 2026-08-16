@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -132,7 +133,7 @@ def _restore_user_after_reference_handoff(
         and messages[-1].get("content") == content
     ):
         return False
-    messages.append({"role": "user", "content": content})
+    append_message(messages, {"role": "user", "content": content})
     return True
 
 
@@ -209,6 +210,20 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
+
+
+def _moa_client_consumes_prepared_request(client: Any) -> bool:
+    """True when ``client`` is the in-process MoA facade.
+
+    ``_moa_prepared_request`` is a private handshake with
+    ``MoAChatCompletions.create``, and only that facade exposes ``prepare()``.
+    Every other chat-completions object raises TypeError on the unexpected
+    keyword — including the native OpenAI client that credential rotation,
+    provider fallback and dead-connection cleanup rebuild from
+    ``_client_kwargs`` while ``agent.provider`` stays ``"moa"``.
+    """
+    completions = getattr(getattr(client, "chat", None), "completions", None)
+    return callable(getattr(completions, "prepare", None))
 
 
 def _join_truncated_parts(parts: List[str]) -> str:
@@ -299,8 +314,9 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     if messages and messages[-1].get("role") == "assistant":
         # Transcript shows the user's own words; the provider replays the
         # scaffolded form so it still sees the interrupted context.
-        messages.append(
-            {"role": "user", "content": text, "api_content": correction}
+        append_message(
+            messages,
+            {"role": "user", "content": text, "api_content": correction},
         )
     else:
         # Placeholder preserves role alternation only. Scaffold bytes must
@@ -313,9 +329,10 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
         }
         if not visible:
             placeholder["display_kind"] = "hidden"
-        messages.append(placeholder)
-        messages.append(
-            {"role": "user", "content": text, "api_content": correction}
+        append_message(messages, placeholder)
+        append_message(
+            messages,
+            {"role": "user", "content": text, "api_content": correction},
         )
 
     agent._current_streamed_assistant_text = ""
@@ -512,6 +529,7 @@ def _billing_or_entitlement_message(
     provider: str,
     base_url: str,
     model: str,
+    unverified: bool = False,
 ) -> str:
     if _is_nous_inference_route(provider, base_url):
         return _nous_entitlement_message(capability)
@@ -526,16 +544,45 @@ def _billing_or_entitlement_message(
     # apply to a subscription — the user waits for the reset or switches to an
     # API key.
     if (provider or "").strip().lower() == "anthropic":
-        lines = [
-            (
-                f"{provider_label} reported that your Claude subscription usage is "
-                f"exhausted for {model_label} (included quota + extra-usage credits)."
-            ),
-            "Options: wait for the billing cycle to reset, or add extra usage at "
-            "https://claude.ai/settings/usage",
-            "You can also switch to an Anthropic API key or another provider with "
-            "/model <model> --provider <provider>.",
-        ]
+        # ``unverified`` (ClassifiedError.billing_unverified, #82154): the
+        # "out of extra usage" 400 is ambiguous — Anthropic returns the same
+        # body when its server-side content filter rejects part of the request
+        # on a subscription OAuth token, so the message reliably misdirects
+        # diagnosis toward buying quota. Hedge the claim and name the other
+        # cause. A confirmed verdict (e.g. a real 402 or an API-key credit
+        # depletion) keeps the assertive wording.
+        if unverified:
+            lines = [
+                (
+                    f"{provider_label} reported that your Claude subscription usage may be "
+                    f"exhausted for {model_label} (included quota + extra-usage credits) — "
+                    "but this specific error is not proof of a billing problem."
+                ),
+                "If https://claude.ai/settings/usage still shows quota remaining, this is "
+                "probably NOT a billing problem: on a Claude subscription (OAuth) token "
+                "Anthropic returns this same message when its content filter rejects part "
+                "of the request — typically a phrase in the system prompt.",
+                "If usage really is exhausted: wait for the billing cycle to reset, or add "
+                "extra usage at https://claude.ai/settings/usage",
+                "You can also switch to an Anthropic API key or another provider with "
+                "/model <model> --provider <provider>.",
+                # The exhaustion latch replays the stored error without issuing
+                # a request, so a real fix looks like it didn't work.
+                "Retry with a fresh credential state: `hermes auth reset anthropic`. Until "
+                "that cooldown clears, this error can be replayed from cache without "
+                "contacting the API.",
+            ]
+        else:
+            lines = [
+                (
+                    f"{provider_label} reported that your Claude subscription usage is "
+                    f"exhausted for {model_label} (included quota + extra-usage credits)."
+                ),
+                "Options: wait for the billing cycle to reset, or add extra usage at "
+                "https://claude.ai/settings/usage",
+                "You can also switch to an Anthropic API key or another provider with "
+                "/model <model> --provider <provider>.",
+            ]
         return "\n".join(lines)
 
     # Provider-agnostic billing URL derivation (OpenAI, DeepSeek, xAI, Groq,
@@ -564,16 +611,84 @@ def _billing_or_entitlement_message(
     return "\n".join(lines)
 
 
-def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]:
+def _billing_block_dict(
+    provider, base_url, model, message="", *, unverified: bool = False
+) -> Optional[dict]:
     """Best-effort structured billing descriptor (None if billing_links is unavailable)."""
     try:
         from agent.billing_links import build_billing_block
 
-        return build_billing_block(
+        block = build_billing_block(
             provider=provider, base_url=str(base_url), model=model, message=message
         ).to_dict()
     except Exception:
         return None
+    if block is not None and unverified:
+        # Carry the classifier's ambiguity into the structured descriptor so
+        # every surface rendering the block can hedge too (#82154).
+        block["unverified"] = True
+    return block
+
+
+def _billing_terminal_label(summary: str, unverified: bool) -> str:
+    """Terminal-failure prefix for a billing-classified error.
+
+    ``unverified`` (#82154): the Anthropic "out of extra usage" 400 can be a
+    content-filter rejection, so the terminal line must not assert billing
+    exhaustion as fact.
+    """
+    if unverified:
+        return (
+            "Provider reported usage/credit exhaustion (unverified — the same "
+            f"error can be a content-filter rejection, not billing): {summary}"
+        )
+    return f"Billing or credits exhausted: {summary}"
+
+
+def _billing_failure_result(
+    *,
+    classified,
+    summary: str,
+    messages,
+    api_call_count: int,
+    provider: str,
+    base_url,
+    model: str,
+    guidance: Optional[str] = None,
+) -> dict:
+    """Structured terminal result for a billing-classified failure.
+
+    Single construction point for the returned terminal response so the
+    label, guidance, structured block, and ambiguity flag stay consistent
+    across the non-retryable abort and max-retries paths (#82154).
+    """
+    unverified = bool(getattr(classified, "billing_unverified", False))
+    if guidance is None:
+        guidance = _billing_or_entitlement_message(
+            capability="model access",
+            provider=provider,
+            base_url=str(base_url),
+            model=model,
+            unverified=unverified,
+        )
+    final = _billing_terminal_label(summary, unverified)
+    if guidance:
+        final += f"\n\n{guidance}"
+    return {
+        "final_response": final,
+        "messages": messages,
+        "api_calls": api_call_count,
+        "completed": False,
+        "failed": True,
+        "error": summary,
+        "failure_reason": classified.reason.value,
+        # The billing verdict may rest on an ambiguous body (#82154) — carry
+        # that through the structured result, not just the prose.
+        "billing_unverified": unverified,
+        "billing_block": _billing_block_dict(
+            provider, base_url, model, guidance, unverified=unverified
+        ),
+    }
 
 
 def _print_billing_or_entitlement_guidance(
@@ -583,12 +698,14 @@ def _print_billing_or_entitlement_guidance(
     provider: str,
     base_url: str,
     model: str,
+    unverified: bool = False,
 ) -> bool:
     message = _billing_or_entitlement_message(
         capability=capability,
         provider=provider,
         base_url=base_url,
         model=model,
+        unverified=unverified,
     )
     if not message:
         return False
@@ -1237,6 +1354,9 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         effective = sp
         if agent.ephemeral_system_prompt:
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        _policy_continuation = getattr(agent, "_internal_policy_continuation", None)
+        if _policy_continuation:
+            effective = (effective + "\n\n[Internal Policy Context]\n" + _policy_continuation).strip()
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1638,6 +1758,9 @@ def run_conversation(
     # Reset alongside the failure flag so a lock-contention diagnosis from a
     # previous turn can never leak into this turn's user-facing explanation.
     agent._last_persistence_error_cause = None
+    # Per-turn diagnostic: a failed compression-tip adoption in a previous
+    # turn's flush must not be reported against this turn.
+    agent._compression_adoption_failed = False
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -2036,6 +2159,10 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        _policy_continuation = getattr(agent, "_internal_policy_continuation", None)
+        if _policy_continuation:
+            effective_system = (effective_system + "\n\n[Internal Policy Context]\n" + _policy_continuation).strip()
+            agent._internal_policy_continuation = None
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2256,7 +2383,7 @@ def run_conversation(
             final_response = _runtime_context_error
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
-            messages.append({"role": "assistant", "content": final_response})
+            append_message(messages, {"role": "assistant", "content": final_response})
             agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
             agent._api_call_count = api_call_count
@@ -2710,7 +2837,24 @@ def run_conversation(
                 # only after middleware, hooks, and debug dumps so none of them
                 # attempts to serialize it as part of the provider payload.
                 if _moa_prepared_request is not None and agent.provider == "moa":
-                    api_kwargs["_moa_prepared_request"] = _moa_prepared_request
+                    # Re-read the live client instead of trusting the one that
+                    # prepared the request above. Credential rotation, provider
+                    # fallback and dead-connection cleanup all rebuild
+                    # agent.client from _client_kwargs between attempts, and
+                    # pending_moa_prepared_request carries a prepared request
+                    # across exactly that boundary. The rebuilt client is a
+                    # native OpenAI client while provider stays "moa", so this
+                    # private key would reach the SDK as an unexpected keyword
+                    # — a non-retryable TypeError that kills every remaining
+                    # turn on the session.
+                    if _moa_client_consumes_prepared_request(agent.client):
+                        api_kwargs["_moa_prepared_request"] = _moa_prepared_request
+                    else:
+                        logger.warning(
+                            "MoA client replaced mid-turn (client=%s); sending the "
+                            "prepared prompt without the MoA handshake",
+                            type(agent.client).__name__,
+                        )
 
                 # Always prefer the streaming path — even without stream
                 # consumers.  Streaming gives us fine-grained health
@@ -3460,7 +3604,7 @@ def run_conversation(
                                 interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
                                 # Marked so the ceiling exit can drop the fragment trail.
                                 interim_msg["_length_continuation_fragment"] = True
-                                messages.append(interim_msg)
+                                append_message(messages, interim_msg)
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
@@ -3500,7 +3644,7 @@ def run_conversation(
                                     "content": _continue_content,
                                     "_length_continuation_nudge": True,
                                 }
-                                messages.append(continue_msg)
+                                append_message(messages, continue_msg)
                                 agent._session_messages = messages
                                 _retry.restart_with_length_continuation = True
                                 break
@@ -3531,7 +3675,7 @@ def run_conversation(
                                 )
                             ]
                             if partial_response:
-                                messages.append({
+                                append_message(messages, {
                                     "role": "assistant",
                                     "content": partial_response,
                                     "finish_reason": "length",
@@ -3978,7 +4122,7 @@ def run_conversation(
                     getattr(agent, "_current_streamed_assistant_text", "") or ""
                 ).strip()
                 if _partial:
-                    messages.append({"role": "assistant", "content": _partial})
+                    append_message(messages, {"role": "assistant", "content": _partial})
                     final_response = _partial
                 else:
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
@@ -4334,6 +4478,7 @@ def run_conversation(
                     has_retried_429=_retry.has_retried_429,
                     classified_reason=classified.reason,
                     error_context=error_context,
+                    billing_unverified=classified.billing_unverified,
                 )
                 if recovered_with_pool:
                     continue
@@ -4978,9 +5123,17 @@ def run_conversation(
                                 "switching to fallback model..."
                             )
                         elif classified.reason == FailoverReason.billing:
-                            agent._buffer_status(
-                                "⚠️ Billing or credits exhausted — switching to fallback provider..."
-                            )
+                            if classified.billing_unverified:
+                                # Ambiguous body (#82154) — don't assert billing.
+                                agent._buffer_status(
+                                    "⚠️ Provider reported usage/credit exhaustion "
+                                    "(unverified — may be a content-filter rejection) "
+                                    "— switching to fallback provider..."
+                                )
+                            else:
+                                agent._buffer_status(
+                                    "⚠️ Billing or credits exhausted — switching to fallback provider..."
+                                )
                         elif _is_transport_failure:
                             agent._buffer_status(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
@@ -5112,7 +5265,7 @@ def run_conversation(
                 if (
                     status_code == 413
                     and isinstance(agent.base_url, str)
-                    and "models.inference.ai.azure.com" in agent.base_url
+                    and base_url_host_matches(agent.base_url, "models.inference.ai.azure.com")
                 ):
                     agent._vprint(
                         f"{agent.log_prefix}   💡 GitHub Models free tier (models.inference.ai.azure.com) caps every",
@@ -5677,6 +5830,7 @@ def run_conversation(
                             provider=_provider,
                             base_url=str(_base),
                             model=_model,
+                            unverified=classified.billing_unverified,
                         ):
                             pass
                         elif _provider == "nous" and _print_nous_entitlement_guidance(
@@ -5803,26 +5957,15 @@ def run_conversation(
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
                     if classified.reason == FailoverReason.billing:
-                        _ce_guidance = _billing_or_entitlement_message(
-                            capability="model access",
+                        return _billing_failure_result(
+                            classified=classified,
+                            summary=_nonretryable_summary,
+                            messages=messages,
+                            api_call_count=api_call_count,
                             provider=_provider,
-                            base_url=str(_base),
+                            base_url=_base,
                             model=_model,
                         )
-                        _ce_final = f"Billing or credits exhausted: {_nonretryable_summary}"
-                        if _ce_guidance:
-                            _ce_final += f"\n\n{_ce_guidance}"
-                        _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
-                        return {
-                            "final_response": _ce_final,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "failed": True,
-                            "error": _nonretryable_summary,
-                            "failure_reason": classified.reason.value,
-                            "billing_block": _ce_block,
-                        }
                     return {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
@@ -5866,12 +6009,20 @@ def run_conversation(
                     _final_summary = agent._summarize_api_error(api_error)
                     _billing_guidance = ""
                     if classified.reason == FailoverReason.billing:
-                        agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
+                        if classified.billing_unverified:
+                            # Ambiguous body (#82154) — hedge the terminal line.
+                            agent._emit_status(
+                                "❌ Provider reported usage/credit exhaustion "
+                                f"(unverified — may be a content-filter rejection) — {_final_summary}"
+                            )
+                        else:
+                            agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
                         _billing_guidance = _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
                             base_url=str(_base),
                             model=_model,
+                            unverified=classified.billing_unverified,
                         )
                         _print_billing_or_entitlement_guidance(
                             agent,
@@ -5879,6 +6030,7 @@ def run_conversation(
                             provider=_provider,
                             base_url=str(_base),
                             model=_model,
+                            unverified=classified.billing_unverified,
                         )
                     elif is_rate_limited:
                         agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -5985,13 +6137,20 @@ def run_conversation(
                         )
                     agent._persist_session(messages, conversation_history)
                     _billing_block = None
+                    _billing_unverified = False
                     if classified.reason == FailoverReason.billing:
-                        _final_response = f"Billing or credits exhausted: {_final_summary}"
+                        _billing_unverified = classified.billing_unverified
+                        _final_response = _billing_terminal_label(
+                            _final_summary, _billing_unverified
+                        )
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
                         # Structured recovery descriptor so every surface renders
                         # the same link + label from one signal (see helper).
-                        _billing_block = _billing_block_dict(_provider, _base, _model, _billing_guidance)
+                        _billing_block = _billing_block_dict(
+                            _provider, _base, _model, _billing_guidance,
+                            unverified=_billing_unverified,
+                        )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -6031,6 +6190,9 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        # True when the billing verdict rests on an ambiguous
+                        # body (#82154) — may be a content-filter rejection.
+                        "billing_unverified": _billing_unverified,
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,
@@ -6424,7 +6586,7 @@ def run_conversation(
                                 else:
                                     last_msg[_key] = interim_msg[_key]
                     else:
-                        messages.append(interim_msg)
+                        append_message(messages, interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
 
                 if agent._codex_incomplete_retries < 3:
@@ -6462,7 +6624,7 @@ def run_conversation(
                             and _last_msg.get("role") == "assistant"
                         )
                         if not _already_nudged and _last_is_assistant:
-                            messages.append({
+                            append_message(messages, {
                                 "role": "user",
                                 "content": _CODEX_INCOMPLETE_NUDGE,
                             })
@@ -6582,7 +6744,7 @@ def run_conversation(
                         }
 
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                    messages.append(assistant_msg)
+                    append_message(messages, assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
                         if _tc_name not in agent.valid_tool_names:
@@ -6593,7 +6755,7 @@ def run_conversation(
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
-                        messages.append({
+                        append_message(messages, {
                             "role": "tool",
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
@@ -6683,7 +6845,7 @@ def run_conversation(
                         
                         # Append the assistant message with its (broken) tool_calls
                         recovery_assistant = agent._build_assistant_message(assistant_message, finish_reason)
-                        messages.append(recovery_assistant)
+                        append_message(messages, recovery_assistant)
                         
                         # Respond with tool error results for each tool call
                         invalid_names = {name for name, _ in invalid_json_args}
@@ -6697,7 +6859,7 @@ def run_conversation(
                                 )
                             else:
                                 tool_result = "Skipped: other tool call in this response had invalid JSON."
-                            messages.append({
+                            append_message(messages, {
                                 "role": "tool",
                                 "name": tc.function.name,
                                 "tool_call_id": tc.id,
@@ -6836,7 +6998,7 @@ def run_conversation(
                     and previous_msg.get("finish_reason") == "incomplete"
                     and previous_interim_visible == current_interim_visible
                 )
-                messages.append(assistant_msg)
+                append_message(messages, assistant_msg)
 
                 # Mixed batch: error-result the invalid calls and strip them
                 # from the execution set. The assistant message above keeps
@@ -6845,7 +7007,7 @@ def run_conversation(
                 # provider-side tool_call/result pairing stays intact.
                 if _invalid_batch_calls:
                     for tc in _invalid_batch_calls:
-                        messages.append({
+                        append_message(messages, {
                             "role": "tool",
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
@@ -6930,7 +7092,17 @@ def run_conversation(
                     agent._emit_status(
                         f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
                     )
-                    messages.append({"role": "assistant", "content": final_response})
+                    append_message(messages, {
+                        "role": "assistant",
+                        "content": final_response,
+                        "model": getattr(agent, "model", None),
+                        "billing_provider": getattr(agent, "provider", None),
+                        "operational_status": "blocked",
+                    })
+                    if getattr(agent, "_safety_finalization_hold", False):
+                        agent._safety_finalization_status = "blocked"
+                        agent._discard_safety_finalization_output()
+                        agent._safety_finalization_released = True
                     # Emit the halt message to the client so it's not
                     # indistinguishable from a crash.  The stream display
                     # was flushed (callback(None)) before tool execution,
@@ -7257,8 +7429,8 @@ def run_conversation(
                         _nudge_msg = agent._build_assistant_message(assistant_message, finish_reason)
                         _nudge_msg["content"] = "(empty)"
                         _nudge_msg["_empty_recovery_synthetic"] = True
-                        messages.append(_nudge_msg)
-                        messages.append({
+                        append_message(messages, _nudge_msg)
+                        append_message(messages, {
                             "role": "user",
                             "content": _EMPTY_TOOL_RESPONSE_NUDGE,
                             "_empty_recovery_synthetic": True,
@@ -7295,7 +7467,7 @@ def run_conversation(
                             assistant_message, "incomplete"
                         )
                         interim_msg["_thinking_prefill"] = True
-                        messages.append(interim_msg)
+                        append_message(messages, interim_msg)
                         agent._session_messages = messages
                         continue
 
@@ -7418,7 +7590,7 @@ def run_conversation(
                     # were a meaningful model response, which can keep long
                     # tool-heavy sessions stuck in empty-response loops.
                     assistant_msg["_empty_terminal_sentinel"] = True
-                    messages.append(assistant_msg)
+                    append_message(messages, assistant_msg)
 
                     if reasoning_text:
                         reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
@@ -7497,14 +7669,14 @@ def run_conversation(
                 ):
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
-                    messages.append(interim_msg)
+                    append_message(messages, interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
                     continue_msg = {
                         "role": "user",
                         "content": _CODEX_ACK_CONTINUATION_NUDGE,
                     }
-                    messages.append(continue_msg)
+                    append_message(messages, continue_msg)
                     agent._session_messages = messages
                     # An acknowledgment is explicitly non-final. Do not let its
                     # text suppress iteration-limit summarization if this
@@ -7567,8 +7739,8 @@ def run_conversation(
                     # buried mid-list in live memory but is skipped by the
                     # flush regardless of position.
                     final_msg["_dropped_toolcall_nudge"] = True
-                    messages.append(final_msg)
-                    messages.append({
+                    append_message(messages, final_msg)
+                    append_message(messages, {
                         "role": "user",
                         "content": _DROPPED_TOOLCALL_NUDGE_CONTENT,
                         "_dropped_toolcall_nudge": True,
@@ -7599,6 +7771,8 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                # Upstream verification loop gates: verify-on-stop and pre_verify
+                # are preserved as provisional components of continuation.
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
@@ -7622,35 +7796,25 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
-                    messages.append({
+                    if getattr(agent, "_safety_finalization_hold", False):
+                        agent._discard_safety_finalization_output()
+                        final_msg["_safety_finalization_candidate"] = True
+                        append_message(messages, final_msg)
+                    else:
+                        agent._emit_interim_assistant_message(final_msg)
+                        append_message(messages, final_msg)
+                        try:
+                            agent._flush_messages_to_session_db(messages, conversation_history)
+                        except Exception:
+                            logger.debug("verify-on-stop interim flush failed", exc_info=True)
+                    append_message(messages, {
                         "role": "user",
                         "content": _verify_nudge,
                         "_verification_stop_synthetic": True,
                     })
                     agent._session_messages = messages
-                    # Run the verification-stop loop silently — the nudge is an
-                    # internal turn that should not add noise to the user's
-                    # terminal. Keep a debug breadcrumb in agent.log for tracing.
                     logger.debug("verification stop-loop nudge issued (attempt %d)",
                                  agent._verification_stop_nudges)
-                    # Keep the attempted answer only as an explicit fallback for
-                    # continuation-budget exhaustion.  ``final_response`` itself
-                    # must be cleared so the finalizer can distinguish this gate
-                    # from unrelated error/recovery exits. (#61631)
-                    # Track whether this candidate was already streamed so the
-                    # finalizer can mark the turn previewed only if the
-                    # candidate is actually reused as the final response.
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
@@ -7658,11 +7822,6 @@ def run_conversation(
                     final_response = None
                     continue
 
-                # User verification-loop gate: when the agent edited code this
-                # turn, let a registered `pre_verify` hook (plugin/shell) keep it
-                # going one more turn. The shipped guidance is folded into the
-                # evidence-based verify-on-stop nudge above, so this path has no
-                # default continuation cost.
                 _verify_nudge2 = None
                 _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
@@ -7671,8 +7830,8 @@ def run_conversation(
                     from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
-                        # Posture is fixed for the session — resolve once + cache.
+                    if (_edited and has_hook("pre_verify")
+                            and _attempt < max_verify_nudges()):
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:
                             from agent.coding_context import is_coding_context
@@ -7694,18 +7853,18 @@ def run_conversation(
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("pre_verify interim flush failed", exc_info=True)
-                    messages.append({
+                    if getattr(agent, "_safety_finalization_hold", False):
+                        agent._discard_safety_finalization_output()
+                        final_msg["_safety_finalization_candidate"] = True
+                        append_message(messages, final_msg)
+                    else:
+                        agent._emit_interim_assistant_message(final_msg)
+                        append_message(messages, final_msg)
+                        try:
+                            agent._flush_messages_to_session_db(messages, conversation_history)
+                        except Exception:
+                            logger.debug("pre_verify interim flush failed", exc_info=True)
+                    append_message(messages, {
                         "role": "user",
                         "content": _verify_nudge2,
                         "_pre_verify_synthetic": True,
@@ -7719,6 +7878,77 @@ def run_conversation(
                     )
                     final_response = None
                     continue
+
+                # A material turn is contained by the generic finalization gate.
+                _safety_hold = bool(getattr(agent, "_safety_finalization_hold", False))
+                if _safety_hold:
+                    try:
+                        from agent.finalization_gate import (
+                            evidence_metadata,
+                            fallback_text,
+                            terminal_decision,
+                        )
+                        from hermes_cli.lifecycle import invoke_hook
+
+                        _safety_attempt = int(getattr(agent, "_safety_finalization_nudges", 0) or 0)
+                        _safety_evidence = [
+                            {
+                                "role": item.get("role"),
+                                "tool_name": item.get("tool_name"),
+                                "effect_disposition": item.get("effect_disposition"),
+                                "observed": bool(item.get("observed")),
+                                "timestamp": item.get("timestamp"),
+                            }
+                            for item in messages[-64:]
+                            if isinstance(item, dict) and item.get("role") == "tool"
+                        ]
+                        _safety_decision = terminal_decision(
+                            invoke_hook(
+                                "pre_finalize",
+                                phase="terminal",
+                                owner=getattr(agent, "_safety_gate_owner", None),
+                                session_id=getattr(agent, "session_id", "") or "",
+                                platform=getattr(agent, "platform", "") or "",
+                                model=getattr(agent, "model", "") or "",
+                                provider=getattr(agent, "provider", "") or "",
+                                operator_request=original_user_message,
+                                candidate_response=final_response or "",
+                                attempt=_safety_attempt,
+                                changed_paths=sorted(getattr(agent, "_turn_file_mutation_paths", set()) or []),
+                                evidence=_safety_evidence,
+                                turn_started_at=getattr(agent, "_safety_finalization_started_at", None),
+                            ),
+                            expected_owner=getattr(agent, "_safety_gate_owner", None),
+                        )
+                    except Exception:
+                        logger.warning("pre_finalize terminal hook failed", exc_info=True)
+                        from agent.finalization_gate import terminal_decision
+                        _safety_decision = terminal_decision((), expected_owner=getattr(agent, "_safety_gate_owner", None))
+
+                    if _safety_decision.continue_required and _safety_attempt < 1:
+                        agent._discard_safety_finalization_output()
+                        agent._current_streamed_assistant_text = ""
+                        _follow_up = _safety_decision.message.strip() or (
+                            "Obtain fresh observable evidence before claiming completion. "
+                            "Do not replace or relax the operator's request."
+                        )
+                        agent._internal_policy_continuation = _follow_up
+                        agent._safety_finalization_nudges = _safety_attempt + 1
+                        agent._session_messages = messages
+                        final_response = None
+                        continue
+
+                    agent._safety_finalization_status = _safety_decision.operational_status
+                    agent._safety_finalization_metadata = evidence_metadata(_safety_decision)
+                    if not _safety_decision.accepted:
+                        final_response = fallback_text(_safety_decision)
+                        final_msg["content"] = final_response
+                        final_msg["operational_status"] = _safety_decision.operational_status
+                        final_msg["evidence_metadata"] = agent._safety_finalization_metadata
+                        agent._discard_safety_finalization_output()
+                    else:
+                        final_msg["operational_status"] = "verified"
+                        final_msg["evidence_metadata"] = agent._safety_finalization_metadata
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
                 # Workers must end with kanban_complete / kanban_block.
@@ -7743,8 +7973,8 @@ def run_conversation(
                     )
                     final_msg["finish_reason"] = "kanban_terminal_required"
                     final_msg["_kanban_stop_synthetic"] = True
-                    messages.append(final_msg)
-                    messages.append({
+                    append_message(messages, final_msg)
+                    append_message(messages, {
                         "role": "user",
                         "content": _kanban_nudge,
                         "_kanban_stop_synthetic": True,
@@ -7770,7 +8000,7 @@ def run_conversation(
                     final_response = None
                     continue
 
-                messages.append(final_msg)
+                append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session
                 # otherwise loses a reply the user already saw (#81641). Same
@@ -7862,7 +8092,7 @@ def run_conversation(
                                 "tool_call_id": tc["id"],
                                 "content": f"Error executing tool: {error_msg}",
                             }
-                            messages.append(err_msg)
+                            append_message(messages, err_msg)
                 break
             
             # Non-tool errors don't need a synthetic message injected.
@@ -7886,7 +8116,7 @@ def run_conversation(
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                 # Append as assistant so the history stays valid for
                 # session resume (avoids consecutive user messages).
-                messages.append({"role": "assistant", "content": final_response})
+                append_message(messages, {"role": "assistant", "content": final_response})
                 break
     
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn

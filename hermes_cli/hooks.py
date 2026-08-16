@@ -166,6 +166,18 @@ _DEFAULT_PAYLOADS = {
         "final_response": "All done — the change is applied.",
         "changed_paths": ["src/app.tsx"],
     },
+    "pre_finalize": {
+        "phase": "terminal",
+        "session_id": "test-session",
+        "platform": "cli",
+        "model": "gpt-4",
+        "provider": "openai",
+        "operator_request": "Verify the deployment is healthy.",
+        "candidate_response": "The deployment is healthy.",
+        "attempt": 0,
+        "changed_paths": [],
+        "messages": [],
+    },
     "on_session_start": {"session_id": "test-session"},
     "on_session_end": {
         "session_id": "test-session",

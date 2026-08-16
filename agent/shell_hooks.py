@@ -813,6 +813,18 @@ def _parse_response(event: str, stdout: str) -> Optional[Dict[str, Any]]:
                 return {"action": "continue", "message": message.strip()}
         return None
 
+    if event == "pre_finalize":
+        # The generic gate validates the full directive. Keep this parser
+        # deliberately structural: shell hooks may only return a known action
+        # and bounded metadata; they cannot replace the operator request.
+        action = str(data.get("action") or "").strip().lower()
+        if action in {
+            "hold", "accept", "continue_recheck", "continue_review",
+            "withhold_unverified", "withhold_blocked",
+        }:
+            return data
+        return None
+
     context = data.get("context")
     if isinstance(context, str) and context.strip():
         return {"context": context}
