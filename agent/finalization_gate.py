@@ -269,11 +269,21 @@ def terminal_decision(
     )
 
 
-def fallback_text(decision: FinalizationDecision) -> str:
-    """Stable, claim-free response used when a held candidate is withheld."""
+def fallback_text(decision: FinalizationDecision, candidate_response: str = "") -> str:
+    """Non-destructive, transparent response used when a held candidate is unverified."""
     if decision.operational_status == "blocked":
-        return "The requested outcome is blocked pending an operator decision; it has not been claimed as complete."
-    return "The requested outcome could not be verified from fresh observable evidence; it has not been claimed as complete."
+        banner = (
+            "> ⚠️ **[SYSTEM GUARD — BLOCKED ACTION]**\n"
+            "> *The requested operational outcome is blocked pending an operator decision; it has not been claimed as complete.*\n\n"
+        )
+    else:
+        banner = (
+            "> ⚠️ **[SYSTEM GUARD — UNVERIFIED ACTION]**\n"
+            "> *The following outcome lacks fresh observable tool evidence and has not been claimed as verified.*\n\n"
+        )
+    if candidate_response and candidate_response.strip():
+        return banner + candidate_response.strip()
+    return banner + "The requested outcome could not be verified from fresh observable evidence; it has not been claimed as complete."
 
 
 def evidence_metadata(decision: FinalizationDecision) -> dict[str, Any]:

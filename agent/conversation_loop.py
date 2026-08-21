@@ -7941,11 +7941,10 @@ def run_conversation(
                     agent._safety_finalization_status = _safety_decision.operational_status
                     agent._safety_finalization_metadata = evidence_metadata(_safety_decision)
                     if not _safety_decision.accepted:
-                        final_response = fallback_text(_safety_decision)
+                        final_response = fallback_text(_safety_decision, final_response or "")
                         final_msg["content"] = final_response
                         final_msg["operational_status"] = _safety_decision.operational_status
                         final_msg["evidence_metadata"] = agent._safety_finalization_metadata
-                        agent._discard_safety_finalization_output()
                     else:
                         final_msg["operational_status"] = "verified"
                         final_msg["evidence_metadata"] = agent._safety_finalization_metadata

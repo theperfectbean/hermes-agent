@@ -141,6 +141,30 @@ def test_continue_and_blocked_directives_preserve_status():
     assert "blocked pending an operator decision" in fallback_text(blocked_decision)
 
 
+def test_fallback_text_preserves_candidate_prose_with_disclosure_banner():
+    unverified_decision = FinalizationDecision(
+        action=WITHHOLD_UNVERIFIED,
+        owner="test-gate",
+        reason="no read-back",
+        operational_status="unverified",
+    )
+    candidate_prose = "Here is my detailed analysis and recommendations for CT 122."
+    output = fallback_text(unverified_decision, candidate_prose)
+
+    assert "⚠️ **[SYSTEM GUARD — UNVERIFIED ACTION]**" in output
+    assert candidate_prose in output
+
+    blocked_decision = FinalizationDecision(
+        action=WITHHOLD_BLOCKED,
+        owner="test-gate",
+        reason="operator block",
+        operational_status="blocked",
+    )
+    blocked_output = fallback_text(blocked_decision, candidate_prose)
+    assert "⚠️ **[SYSTEM GUARD — BLOCKED ACTION]**" in blocked_output
+    assert candidate_prose in blocked_output
+
+
 def test_finalizer_removes_held_candidate_scaffolding():
     from agent.turn_finalizer import _drop_safety_finalization_scaffolding
 
